@@ -1,0 +1,1011 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0d0e16">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Cyber-Pet</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #0d0e16; overflow: hidden; overscroll-behavior: none;
+               -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  body { display: flex; align-items: center; justify-content: center; box-sizing: border-box;
+         padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  canvas { display: block; touch-action: none; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="game" tabindex="0" aria-label="Cyber-Pet game"></canvas>
+<script>
+"use strict";
+// ===========================================================================
+// 1. FSM MODEL
+// ===========================================================================
+const STATES = ["Happy", "Playful", "Bored", "Hungry", "Angry", "Sad", "Sleepy", "Asleep", "Sick", "Drunk"];
+const ACTIONS = ["Kick", "Hug", "Play", "Food", "Candy", "Beer", "Medicine", "Bed"];
+const START_STATE = "Happy";
+const START_STATS = { food: 70, energy: 80, fun: 70, health: 100 };
+
+// Guards see the stats BEFORE the action, plus the pet (for time-based guards).
+const GUARDS = {
+  tired:    s => s.energy < 30,
+  rested:   s => s.energy > 70,
+  full:     s => s.food > 80,
+  starving: s => s.food < 25,
+  weak:     s => s.health < 40,
+  fresh:    (s, p) => p.timeInState < 6,      // "just happened": the feeling is still raw
+};
+
+// TRANSITIONS[state][action] = "Next" | [[guard | null, "Next"], ...]  (first true guard wins)
+const TRANSITIONS = {
+  Happy:   { Kick: "Angry", Hug: "Happy", Play: [["tired", "Sleepy"], [null, "Playful"]],
+             Food: [["full", "Sleepy"], [null, "Happy"]], Candy: "Playful", Beer: "Drunk",
+             Medicine: [["weak", "Happy"], [null, "Angry"]],             // only welcome when unwell
+             Bed: [["tired", "Asleep"], [null, "Bored"]] },
+  Playful: { Kick: "Angry", Hug: "Happy", Play: [["tired", "Sleepy"], [null, "Playful"]], Food: "Happy",
+             Candy: [["full", "Sick"], [null, "Playful"]], Beer: "Drunk", Medicine: "Angry",
+             Bed: [["tired", "Asleep"], [null, "Angry"]] },
+  Bored:   { Kick: "Angry", Hug: "Happy", Play: [["tired", "Sleepy"], [null, "Playful"]],
+             Food: [["full", "Bored"], [null, "Happy"]], Candy: "Playful", Beer: "Drunk", Medicine: "Bored",
+             Bed: [["tired", "Asleep"], [null, "Bored"]] },
+  Hungry:  { Kick: "Angry", Hug: "Sad", Play: "Angry", Food: "Happy",
+             Candy: [["starving", "Hungry"], [null, "Happy"]],          // candy isn't a meal
+             Beer: [["starving", "Sick"], [null, "Drunk"]], Medicine: "Sick",
+             Bed: "Hungry" },                                           // too hungry to sleep
+  Angry:   { Kick: "Sad",
+             Hug: [["fresh", "Sad"], [null, "Happy"]],                  // right after a kick it still hurts
+             Play: [["fresh", "Angry"], [null, "Playful"]],
+             Food: "Happy", Candy: "Happy", Beer: "Drunk", Medicine: "Angry", Bed: "Sleepy" },
+  Sad:     { Kick: "Sad", Hug: "Happy", Play: [["tired", "Sad"], [null, "Playful"]], Food: "Happy", Candy: "Happy",
+             Beer: "Drunk", Medicine: "Sad", Bed: [["tired", "Asleep"], [null, "Sleepy"]] },
+  Sleepy:  { Kick: "Angry", Hug: "Sleepy", Play: "Angry", Food: [["starving", "Happy"], [null, "Sleepy"]],
+             Candy: "Playful", Beer: "Asleep", Medicine: "Sleepy", Bed: "Asleep" },
+  Asleep:  { Kick: "Angry", Hug: [["rested", "Happy"], [null, "Asleep"]], Play: [["rested", "Playful"], [null, "Angry"]],
+             Food: "Asleep", Candy: "Asleep", Beer: "Asleep", Medicine: "Asleep", Bed: "Asleep" },
+  Sick:    { Kick: "Sad", Hug: "Sick", Play: "Sick", Food: "Sick", Candy: "Sick", Beer: "Sick", Medicine: "Sleepy",
+             Bed: [["starving", "Sick"], [null, "Asleep"]] },
+  Drunk:   { Kick: "Angry", Hug: "Happy", Play: "Sick", Food: "Sleepy", Candy: "Drunk",
+             Beer: [["weak", "Sick"], [null, "Drunk"]], Medicine: "Sleepy", Bed: "Asleep" },
+};
+
+const ACTION_EFFECTS = {
+  Kick: { health: -10, fun: -15 },
+  Hug: { fun: +12, health: +3 },
+  Play: { fun: +30, energy: -18, food: -8 },
+  Food: { food: +40, energy: +5 },
+  Candy: { food: +8, fun: +15, energy: +10, health: -5 },
+  Beer: { fun: +15, health: -12, energy: -10, food: +5 },
+  Medicine: { health: +45, fun: -5 },
+  Bed: { energy: +5 },
+};
+
+// Stat change per second (slow pace). STATE_RATES are added on top of BASE_RATES.
+const BASE_RATES = { food: -0.45, energy: -0.35, fun: -0.5, health: 0 };
+const STATE_RATES = {
+  Happy: { health: +0.2 },
+  Playful: { energy: -0.7, fun: +1.0, food: -0.3 },
+  Sad: { fun: -0.2 },
+  Hungry: { health: -0.25, fun: -0.2 },
+  Angry: { energy: -0.2 },
+  Asleep: { food: +0.25, energy: +4.0, fun: +0.6, health: +0.8 },   // sleeping burns food slower
+  Sick: { health: -0.3, energy: -0.2, fun: -0.2 },
+  Drunk: { health: -0.3, fun: +0.8, energy: -0.2 },
+};
+
+const allExcept = (...xs) => new Set(STATES.filter(s => !xs.includes(s)));
+const AUTO_RULES = [ // [label, condition, target, states it can fire from] - highest priority first
+  ["health<20", s => s.health < 20, "Sick", allExcept("Sick", "Asleep")],
+  ["recovered", s => s.health >= 75, "Sleepy", new Set(["Sick"])],
+  ["food<15", s => s.food < 15, "Hungry", allExcept("Hungry", "Sick")],
+  ["energy<15", s => s.energy < 15, "Sleepy", allExcept("Sleepy", "Asleep", "Sick", "Hungry")],
+  ["rested", s => s.energy >= 98, "Happy", new Set(["Asleep"])],
+  ["fun<15", s => s.fun < 15, "Bored", new Set(["Happy", "Playful"])],
+];
+
+// Moods that wear off: state -> [seconds, next]
+const TIMEOUTS = { Playful: [25, "Happy"], Angry: [20, "Sad"], Sad: [40, "Bored"], Bored: [60, "Sad"],
+                   Sleepy: [25, "Asleep"], Drunk: [25, "Sleepy"] };
+
+function validateFsm() {
+  const errors = [];
+  for (const st of STATES) {
+    const row = TRANSITIONS[st];
+    if (!row) { errors.push(`missing row for state '${st}'`); continue; }
+    for (const act of ACTIONS) {
+      const e = row[act];
+      if (e === undefined) errors.push(`${st}: missing action '${act}'`);
+      else if (typeof e === "string") { if (!STATES.includes(e)) errors.push(`${st}/${act}: unknown target '${e}'`); }
+      else {
+        if (!e.length || e[e.length - 1][0] !== null) errors.push(`${st}/${act}: rules must end with [null, default]`);
+        for (const [g, t] of e) {
+          if (g !== null && !(g in GUARDS)) errors.push(`${st}/${act}: unknown guard '${g}'`);
+          if (!STATES.includes(t)) errors.push(`${st}/${act}: unknown target '${t}'`);
+        }
+      }
+    }
+    for (const k of Object.keys(row)) if (!ACTIONS.includes(k)) errors.push(`${st}: unknown action '${k}'`);
+  }
+  for (const [st, [, t]] of Object.entries(TIMEOUTS))
+    if (!STATES.includes(st) || !STATES.includes(t)) errors.push(`bad timeout ${st} -> ${t}`);
+  if (errors.length) throw new Error("Invalid FSM:\n" + errors.join("\n"));
+}
+
+function resolveTransition(state, action, stats, pet) {
+  const e = TRANSITIONS[state][action];
+  if (typeof e === "string") return [e, null];
+  for (const [g, t] of e) if (g === null || GUARDS[g](stats, pet)) return [t, g];
+}
+const possibleTargets = (state, action) => {
+  const e = TRANSITIONS[state][action];
+  return typeof e === "string" ? [e] : e.map(r => r[1]);
+};
+const clamp = v => Math.max(0, Math.min(100, v));
+
+class Pet {
+  constructor() { this.reset(); }
+  reset() { this.state = START_STATE; this.stats = { ...START_STATS }; this.timeInState = 0; }
+  enter(s) { if (s !== this.state) this.timeInState = 0; this.state = s; }
+  preview(action) { return resolveTransition(this.state, action, this.stats, this); }
+  apply(action) {
+    const old = this.state;
+    const [nw, guard] = this.preview(action);
+    const ignored = old === "Asleep" && nw === "Asleep";
+    if (!ignored) for (const [k, v] of Object.entries(ACTION_EFFECTS[action])) this.stats[k] = clamp(this.stats[k] + v);
+    this.enter(nw);
+    return { trigger: action, old, nw, reason: guard ? `[${guard}]` : ignored ? "(asleep)" : "" };
+  }
+  tick(dt) {
+    const rates = { ...BASE_RATES };
+    for (const [k, v] of Object.entries(STATE_RATES[this.state] || {})) rates[k] += v;
+    for (const [k, r] of Object.entries(rates)) this.stats[k] = clamp(this.stats[k] + r * dt);
+    this.timeInState += dt;
+    for (const [label, cond, target, sources] of AUTO_RULES) {
+      if (!cond(this.stats)) continue;
+      if (this.state === target) break;
+      if (sources.has(this.state)) { const old = this.state; this.enter(target); return { trigger: "auto", old, nw: target, reason: label }; }
+    }
+    const to = TIMEOUTS[this.state];
+    if (to && this.timeInState >= to[0]) {
+      const old = this.state; this.enter(to[1]);
+      return { trigger: "timer", old, nw: to[1], reason: `${to[0]}s` };
+    }
+    return null;
+  }
+  timerInfo() { const to = TIMEOUTS[this.state]; return to ? [to[1], Math.max(0, to[0] - this.timeInState)] : null; }
+}
+
+// ===========================================================================
+// 2. SOUND (synthesized robot voice - no audio files needed)
+// ===========================================================================
+const Sfx = {
+  ctx: null, master: null, nb: null, on: true,
+  init() {
+    if (this.ctx) { if (this.ctx.state === "suspended") this.ctx.resume(); return; }
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      this.ctx = new AC();
+      const comp = this.ctx.createDynamicsCompressor();
+      this.master = this.ctx.createGain(); this.master.gain.value = 0.55;
+      this.master.connect(comp); comp.connect(this.ctx.destination);
+      const len = this.ctx.sampleRate;
+      this.nb = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+      const d = this.nb.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    } catch (e) { this.ctx = null; }
+  },
+  ok() { return this.on && this.ctx && this.ctx.state === "running"; },
+  tone(f0, f1, dur, { type = "square", vol = 0.1, delay = 0, vib = 0, rate = 8, attack = 0.01 } = {}) {
+    if (!this.ok()) return;
+    const c = this.ctx, t = c.currentTime + delay, o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t);
+    if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    if (vib) {
+      const l = c.createOscillator(), lg = c.createGain();
+      l.frequency.value = rate; lg.gain.value = vib; l.connect(lg); lg.connect(o.frequency);
+      l.start(t); l.stop(t + dur + 0.05);
+    }
+    o.connect(g); g.connect(this.master); o.start(t); o.stop(t + dur + 0.05);
+  },
+  noise(dur, { vol = 0.2, delay = 0, freq = 1000, q = 1, type = "bandpass", attack = 0.005, sweep = 0 } = {}) {
+    if (!this.ok()) return;
+    const c = this.ctx, t = c.currentTime + delay, src = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    src.buffer = this.nb; src.loop = true;
+    f.type = type; f.frequency.setValueAtTime(freq, t); f.Q.value = q;
+    if (sweep) f.frequency.exponentialRampToValueAtTime(sweep, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(f); f.connect(g); g.connect(this.master);
+    src.start(t, Math.random() * 0.5); src.stop(t + dur + 0.05);
+  },
+  babble(n, lo, hi, { delay = 0, step = 0.085, type = "square", vol = 0.06 } = {}) {
+    for (let i = 0; i < n; i++) {
+      const f = rand(lo, hi);
+      this.tone(f, f * rand(0.85, 1.2), step * 0.85, { type, vol, delay: delay + i * step });
+    }
+  },
+  voice(mood, delay = 0) {
+    const T = (a, b, d, o = {}) => this.tone(a, b, d, { ...o, delay: delay + (o.delay || 0) });
+    const N = (d, o = {}) => this.noise(d, { ...o, delay: delay + (o.delay || 0) });
+    switch (mood) {
+      case "Happy": [660, 880, 990, 1320].forEach((f, i) => T(f, f * 1.05, 0.09, { type: "triangle", vol: 0.12, delay: i * 0.08 })); break;
+      case "Playful": [523, 784, 1047, 784, 1047, 1568].forEach((f, i) => T(f, f, 0.07, { type: "square", vol: 0.05, delay: i * 0.065 }));
+        T(220, 660, 0.3, { type: "sine", vol: 0.12, vib: 20, rate: 14, delay: 0.42 }); break;
+      case "Bored": T(330, 220, 0.5, { type: "triangle", vol: 0.13 }); T(220, 196, 0.35, { type: "triangle", vol: 0.1, delay: 0.5 }); break;
+      case "Hungry": T(72, 55, 0.9, { type: "sawtooth", vol: 0.1, vib: 8, rate: 11 });
+        N(0.8, { type: "lowpass", freq: 220, vol: 0.12, attack: 0.2 });
+        T(520, 400, 0.35, { type: "square", vol: 0.05, delay: 0.95, vib: 10, rate: 7 }); break;
+      case "Angry": for (let i = 0; i < 3; i++) T(170, 140, 0.18, { type: "sawtooth", vol: 0.12, vib: 35, rate: 45, delay: i * 0.22 }); break;
+      case "Sad": T(740, 370, 1.1, { type: "sine", vol: 0.14, vib: 14, rate: 6, attack: 0.08 }); break;
+      case "Sleepy": T(390, 240, 1.2, { type: "triangle", vol: 0.12, vib: 5, rate: 4, attack: 0.15 });
+        N(1.0, { type: "lowpass", freq: 600, vol: 0.04, attack: 0.3 }); break;
+      case "Asleep": N(1.3, { type: "lowpass", freq: 260, sweep: 650, vol: 0.13, attack: 0.6 });
+        T(85, 75, 1.2, { type: "sawtooth", vol: 0.035, attack: 0.5 });
+        T(900, 1250, 0.6, { type: "sine", vol: 0.025, delay: 1.45, attack: 0.2 }); break;
+      case "Sick": for (let i = 0; i < 2; i++) { N(0.16, { freq: 800, q: 1.5, vol: 0.3, delay: i * 0.26 }); T(220, 150, 0.15, { type: "sawtooth", vol: 0.05, delay: i * 0.26 }); }
+        T(520, 300, 0.7, { type: "sine", vol: 0.06, vib: 16, rate: 6, delay: 0.7 }); break;
+      case "Drunk": T(250, 900, 0.12, { type: "sine", vol: 0.18 });
+        T(420, 300, 0.7, { type: "square", vol: 0.045, vib: 45, rate: 4, delay: 0.3 }); break;
+    }
+  },
+  action(a) {
+    switch (a) {
+      case "Kick": this.tone(160, 40, 0.25, { type: "sine", vol: 0.45 }); this.noise(0.12, { type: "lowpass", freq: 500, vol: 0.35 });
+        this.tone(1000, 480, 0.32, { type: "sawtooth", vol: 0.07, delay: 0.08, vib: 40, rate: 30 }); break;
+      case "Hug": this.tone(520, 700, 0.18, { type: "sine", vol: 0.15 }); this.tone(700, 620, 0.35, { type: "sine", vol: 0.13, delay: 0.18, vib: 6, rate: 6 }); break;
+      case "Play": this.tone(180, 700, 0.35, { type: "sine", vol: 0.18, vib: 25, rate: 14 });
+        [1319, 1568, 2093].forEach((f, i) => this.tone(f, f, 0.08, { type: "triangle", vol: 0.06, delay: 0.3 + i * 0.06 })); break;
+      case "Food": for (let i = 0; i < 3; i++) this.noise(0.07, { freq: 1500, q: 0.8, vol: 0.25, delay: i * 0.15 });
+        this.tone(600, 820, 0.12, { type: "square", vol: 0.05, delay: 0.5 }); break;
+      case "Candy": [1047, 1319, 1568, 2093].forEach((f, i) => this.tone(f, f, 0.1, { type: "triangle", vol: 0.1, delay: i * 0.07 })); break;
+      case "Beer": for (let i = 0; i < 3; i++) this.tone(190, 120, 0.1, { type: "sine", vol: 0.28, delay: i * 0.16 });
+        this.tone(500, 340, 0.5, { type: "triangle", vol: 0.08, delay: 0.55 }); break;
+      case "Medicine": this.tone(300, 180, 0.45, { type: "sawtooth", vol: 0.08, vib: 25, rate: 9 }); break;
+      case "Bed": [784, 659, 523].forEach((f, i) => this.tone(f, f, 0.28, { type: "sine", vol: 0.1, delay: i * 0.3, attack: 0.04 })); break;
+    }
+  },
+  click() { this.tone(900, 900, 0.03, { type: "square", vol: 0.03 }); },
+};
+const VOICE_GAP = { Happy: [8, 14], Playful: [5, 9], Bored: [10, 16], Hungry: [6, 10], Angry: [4, 7], Sad: [8, 12],
+                    Sleepy: [9, 14], Asleep: [3.5, 4.5], Sick: [6, 10], Drunk: [5, 8] };
+
+// ===========================================================================
+// 3. LOOK & FEEL
+// ===========================================================================
+const W = 540;
+let H = 960;   // logical height adapts to the phone's aspect ratio (see fit)
+const MOOD_COLORS = {
+  Happy: [255, 200, 70], Playful: [60, 200, 185], Bored: [150, 150, 165], Hungry: [245, 145, 55], Angry: [232, 72, 62],
+  Sad: [80, 135, 225], Sleepy: [150, 120, 215], Asleep: [75, 85, 165], Sick: [150, 180, 70], Drunk: [225, 110, 190],
+};
+const FACE_COLORS = {
+  Happy: [190, 255, 245], Playful: [200, 255, 235], Bored: [205, 210, 220], Hungry: [255, 225, 165], Angry: [255, 175, 150],
+  Sad: [175, 210, 255], Sleepy: [205, 195, 255], Asleep: [130, 140, 210], Sick: [215, 240, 170], Drunk: [255, 195, 230],
+};
+const BUTTON_COLORS = {
+  Kick: [235, 95, 80], Hug: [245, 135, 180], Play: [70, 205, 190], Food: [120, 205, 115],
+  Candy: [250, 160, 210], Beer: [240, 190, 70], Medicine: [225, 232, 240], Bed: [135, 135, 230],
+};
+const STAT_ORDER = [["food", "Food"], ["energy", "Energy"], ["fun", "Fun"], ["health", "Health"]];
+const AMBIENT_RATE = { Happy: 3, Playful: 5, Bored: 0.5, Hungry: 1.2, Angry: 7, Sad: 2.2, Sleepy: 0.6, Asleep: 0.7, Sick: 1.8, Drunk: 2 };
+const BG_TOP = [22, 24, 38], BG_BOTTOM = [10, 10, 18], SCREEN_BG = [25, 30, 45];
+const TEXT = [230, 232, 240], MUTED = [130, 135, 155], INK = "rgb(28,26,38)";
+const CONFETTI = [[255, 200, 70], [60, 200, 185], [245, 135, 180], [135, 135, 230]];
+const IS_TOUCH = window.matchMedia && matchMedia("(pointer: coarse)").matches;
+
+const lerp = (a, b, t) => a + (b - a) * t;
+const lerpCol = (c1, c2, t) => c1.map((v, i) => Math.round(lerp(v, c2[i], t)));
+const shade = (c, f) => c.map(v => Math.max(0, Math.min(255, Math.round(v * f))));
+const rgb = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+const rand = (a, b) => a + Math.random() * (b - a);
+const choice = arr => arr[Math.floor(Math.random() * arr.length)];
+const FONT = "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+let viewScale = 1;
+function fit() {
+  const cs = getComputedStyle(document.body);
+  const vw = window.innerWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  const vh = window.innerHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+  H = Math.round(Math.max(900, Math.min(1240, W * vh / vw)));
+  layoutScreen();
+  viewScale = Math.min(vw / W, vh / H);
+  const cw = Math.floor(W * viewScale), ch = Math.floor(H * viewScale);
+  canvas.style.width = cw + "px"; canvas.style.height = ch + "px";
+  const pr = Math.min(3, (window.devicePixelRatio || 1) * viewScale);
+  canvas.width = Math.round(W * pr); canvas.height = Math.round(H * pr);
+  ctx.setTransform(pr, 0, 0, pr, 0, 0);
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+}
+window.addEventListener("resize", fit);
+
+// ---- drawing helpers ------------------------------------------------------
+function rrectPath(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function fillRR(x, y, w, h, r, col) { rrectPath(x, y, w, h, r); ctx.fillStyle = col; ctx.fill(); }
+function strokeRR(x, y, w, h, r, col, lw) { rrectPath(x, y, w, h, r); ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke(); }
+function circle(x, y, r, col, lw = 0) {
+  ctx.beginPath(); ctx.arc(x, y, Math.max(0.5, r), 0, Math.PI * 2);
+  if (lw) { ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke(); } else { ctx.fillStyle = col; ctx.fill(); }
+}
+function ellipse(x, y, w, h, col) { ctx.beginPath(); ctx.ellipse(x + w / 2, y + h / 2, Math.abs(w / 2), Math.abs(h / 2), 0, 0, Math.PI * 2); ctx.fillStyle = col; ctx.fill(); }
+function line(x1, y1, x2, y2, col, lw) { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke(); }
+function polyline(pts, col, lw) { ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke(); }
+function poly(pts, col) { ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); ctx.fillStyle = col; ctx.fill(); }
+function arcR(x, y, w, h, a, b, col, lw) { ctx.beginPath(); ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, -a, -b, true); ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke(); }
+function text(str, x, y, size, col, align = "left", baseline = "top", weight = 600) {
+  ctx.font = `${weight} ${size}px ${FONT}`; ctx.fillStyle = col; ctx.textAlign = align; ctx.textBaseline = baseline;
+  ctx.fillText(str, x, y);
+}
+function textW(str, size, weight = 600) { ctx.font = `${weight} ${size}px ${FONT}`; return ctx.measureText(str).width; }
+function heartPts(x, y, s) {
+  const pts = [];
+  for (let i = 0; i < 28; i++) {
+    const t = i / 28 * 2 * Math.PI, hx = 16 * Math.sin(t) ** 3;
+    const hy = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+    pts.push([x + hx * s / 16, y - hy * s / 16]);
+  }
+  return pts;
+}
+function starPts(x, y, R, r, n = 5, rot = -Math.PI / 2) {
+  const pts = [];
+  for (let i = 0; i < n * 2; i++) { const a = rot + i * Math.PI / n, rr = i % 2 ? r : R; pts.push([x + Math.cos(a) * rr, y + Math.sin(a) * rr]); }
+  return pts;
+}
+function drawArrow(col, p1, p2, nodeR, width = 3, dashed = false, offset = 5) {
+  const dx = p2[0] - p1[0], dy = p2[1] - p1[1], dist = Math.hypot(dx, dy) || 1;
+  const ux = dx / dist, uy = dy / dist, nx = -uy * offset, ny = ux * offset;
+  const sx = p1[0] + ux * nodeR + nx, sy = p1[1] + uy * nodeR + ny;
+  const ex = p2[0] - ux * (nodeR + 3) + nx, ey = p2[1] - uy * (nodeR + 3) + ny;
+  ctx.setLineDash(dashed ? [8, 8] : []);
+  line(sx, sy, ex - ux * 6, ey - uy * 6, col, width);
+  ctx.setLineDash([]);
+  const hd = 11;
+  poly([[ex, ey], [ex - ux * hd - uy * hd * 0.55, ey - uy * hd + ux * hd * 0.55], [ex - ux * hd + uy * hd * 0.55, ey - uy * hd - ux * hd * 0.55]], col);
+}
+
+// ---- vector icons (drawn in a -50..50 box) --------------------------------
+function drawIcon(name, x, y, size, ink, accent = "rgba(255,255,255,0.85)") {
+  ctx.save();
+  ctx.translate(x, y); ctx.scale(size / 100, size / 100);
+  ctx.fillStyle = ink; ctx.strokeStyle = ink; ctx.lineCap = "round"; ctx.lineJoin = "round";
+  const PI = Math.PI;
+  switch (name) {
+    case "Kick": {   // boot with motion lines
+      ctx.beginPath(); ctx.moveTo(-22, -44); ctx.lineTo(8, -44); ctx.lineTo(8, -2);
+      ctx.quadraticCurveTo(12, 6, 28, 8); ctx.quadraticCurveTo(46, 12, 46, 28); ctx.lineTo(46, 34); ctx.lineTo(-22, 34); ctx.closePath(); ctx.fill();
+      fillRR(-26, 32, 76, 12, 5, ink);
+      ctx.fillStyle = accent; ctx.fillRect(-22, -36, 30, 6);
+      circle(-2, -18, 3.5, accent); circle(-2, -6, 3.5, accent);
+      line(-46, -18, -34, -18, ink, 6); line(-48, -2, -32, -2, ink, 6); line(-46, 14, -34, 14, ink, 6);
+      break;
+    }
+    case "Hug": poly(heartPts(-6, 6, 40), ink); poly(heartPts(30, -28, 15), ink); poly(heartPts(-20, -6, 9), accent); break;
+    case "Play":     // beach ball
+      circle(0, 0, 42, ink);
+      ctx.lineWidth = 6; ctx.strokeStyle = accent;
+      ctx.beginPath(); ctx.ellipse(0, 0, 16, 42, 0, 0, 2 * PI); ctx.stroke();
+      line(-42, 0, 42, 0, accent, 6);
+      circle(-20, -22, 6, accent);
+      break;
+    case "Food": case "food":   // drumstick
+      ctx.translate(-4, -4); ctx.rotate(-PI / 4);
+      ctx.beginPath(); ctx.ellipse(0, -14, 26, 32, 0, 0, 2 * PI); ctx.fill();
+      ctx.fillStyle = name === "Food" ? accent : ink;
+      ctx.fillRect(-6, 12, 12, 28); circle(-8, 44, 8, ctx.fillStyle); circle(8, 44, 8, ctx.fillStyle);
+      if (name === "Food") circle(-10, -26, 6, accent);
+      break;
+    case "Candy":
+      poly([[-18, 0], [-46, -20], [-46, 20]], ink); poly([[18, 0], [46, -20], [46, 20]], ink);
+      circle(0, 0, 24, ink);
+      ctx.lineWidth = 6; ctx.strokeStyle = accent; ctx.beginPath(); ctx.arc(0, 0, 12, 0, PI * 1.5); ctx.stroke();
+      break;
+    case "Beer":
+      ctx.lineWidth = 10; ctx.beginPath(); ctx.arc(20, 10, 15, -PI / 2, PI / 2); ctx.stroke();
+      fillRR(-32, -20, 52, 62, 9, ink);
+      line(-18, -4, -18, 30, accent, 5); line(-2, -4, -2, 30, accent, 5);
+      circle(-24, -24, 12, accent); circle(-6, -30, 14, accent); circle(12, -24, 12, accent);
+      break;
+    case "Medicine":  // capsule
+      ctx.rotate(-PI / 4);
+      fillRR(-42, -18, 84, 36, 18, ink);
+      ctx.save(); ctx.beginPath(); ctx.rect(0, -20, 44, 40); ctx.clip(); fillRR(-42, -18, 84, 36, 18, accent); ctx.restore();
+      strokeRR(-42, -18, 84, 36, 18, ink, 5);
+      ctx.fillStyle = "rgba(255,255,255,0.5)"; fillRR(-32, -10, 22, 6, 3, "rgba(255,255,255,0.45)");
+      break;
+    case "Bed":       // moon + stars
+      ctx.save(); ctx.beginPath(); ctx.rect(-60, -60, 120, 120); ctx.arc(14, -12, 30, 0, 2 * PI, true); ctx.clip();
+      circle(-6, 4, 38, ink); ctx.restore();
+      poly(starPts(30, -30, 11, 4.5), ink); poly(starPts(38, 14, 7, 3), ink);
+      break;
+    case "energy": poly([[12, -48], [-28, 8], [-3, 8], [-12, 48], [28, -10], [3, -10]], ink); break;
+    case "fun": poly(starPts(0, 4, 48, 21), ink); break;
+    case "health": fillRR(-14, -42, 28, 84, 6, ink); fillRR(-42, -14, 84, 28, 6, ink); break;
+    case "pause": fillRR(-24, -32, 16, 64, 4, ink); fillRR(8, -32, 16, 64, 4, ink); break;
+    case "play": poly([[-20, -34], [32, 0], [-20, 34]], ink); break;
+    case "sound": case "mute":
+      poly([[-40, -14], [-20, -14], [2, -34], [2, 34], [-20, 14], [-40, 14]], ink);
+      ctx.lineWidth = 7;
+      if (name === "sound") {
+        ctx.beginPath(); ctx.arc(4, 0, 18, -0.85, 0.85); ctx.stroke();
+        ctx.beginPath(); ctx.arc(4, 0, 32, -0.85, 0.85); ctx.stroke();
+      } else { line(16, -14, 40, 14, ink, 7); line(40, -14, 16, 14, ink, 7); }
+      break;
+    case "brain":     // tiny state diagram
+      ctx.lineWidth = 6;
+      line(-26, 22, 26, 22, ink, 6); line(-26, 22, 0, -24, ink, 6); line(26, 22, 0, -24, ink, 6);
+      circle(0, -24, 14, ink); circle(-26, 22, 14, ink); circle(26, 22, 14, ink);
+      break;
+  }
+  ctx.restore();
+}
+
+// ===========================================================================
+// 4. PARTICLES
+// ===========================================================================
+class Particle {
+  constructor(kind, x, y, vx, vy, life, color, size, gravity = 0, txt = "") {
+    Object.assign(this, { kind, x, y, vx, vy, life, color, size, gravity, txt });
+    this.age = 0; this.rot = rand(0, Math.PI); this.spin = rand(-4, 4);
+  }
+  update(dt) {
+    this.age += dt; this.vy += this.gravity * dt; this.x += this.vx * dt; this.y += this.vy * dt; this.rot += this.spin * dt;
+    return this.age < this.life;
+  }
+  draw() {
+    const k = 1 - this.age / this.life, a = Math.min(1, k * 1.6);
+    const { x, y, size: s, color } = this, col = rgb(color);
+    ctx.globalAlpha = a;
+    switch (this.kind) {
+      case "spark": poly(starPts(x, y, s, s * 0.38, 4, this.rot), col); break;
+      case "steam": ctx.globalAlpha = a * 0.55; circle(x, y, s * (1 + (1 - k) * 1.8), col); break;
+      case "tear": poly([[x, y - s * 1.1], [x - s * 0.5, y - s * 0.1], [x + s * 0.5, y - s * 0.1]], col); circle(x, y, s * 0.55, col); break;
+      case "heart": poly(heartPts(x, y, s), col); break;
+      case "bubble": circle(x, y, s, col, 2); circle(x - s * 0.35, y - s * 0.35, Math.max(1, s * 0.25), "#fff"); break;
+      case "germ":
+        ctx.globalAlpha = a * 0.8; circle(x, y, s, col); ctx.globalAlpha = a;
+        for (let i = 0; i < 6; i++) { const ang = this.rot + i * Math.PI / 3; line(x + Math.cos(ang) * s, y + Math.sin(ang) * s, x + Math.cos(ang) * s * 1.6, y + Math.sin(ang) * s * 1.6, col, 2); }
+        break;
+      case "icon": drawIcon(this.txt, x, y, s, col, "rgba(255,255,255,0.8)"); break;
+      case "confetti": {
+        const c = Math.cos(this.rot), sn = Math.sin(this.rot), hw = s, hh = s * 0.45;
+        poly([[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([dx, dy]) => [x + c * dx - sn * dy, y + sn * dx + c * dy]), col); break;
+      }
+      case "text": text(this.txt, x, y, s * 0.72, col, "center", "middle", 700); break;
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ===========================================================================
+// 5. LAYOUT & GAME STATE
+// ===========================================================================
+const PET_CX = 270;
+let PET_CY, FLOOR_Y, BTN_TOP, OVL, RESET_BTN, DIAG, buttons = [];
+const BTN = { w: 117, h: 126, gap: 10 };
+const HEADER_BTNS = [
+  { id: "brain", x: W - 38, y: 40 }, { id: "sound", x: W - 92, y: 40 }, { id: "pause", x: W - 146, y: 40 },
+];
+const nodePos = {};
+function layoutScreen() {
+  BTN_TOP = H - 2 * BTN.h - 12 - 34;
+  PET_CY = Math.round(130 + (BTN_TOP - 130) * 0.545);
+  FLOOR_Y = PET_CY + 136;
+  const x0 = (W - (4 * BTN.w + 3 * BTN.gap)) / 2;
+  const flash = Object.fromEntries(buttons.map(b => [b.action, b.flash]));
+  buttons = ACTIONS.map((a, i) => {
+    const row = Math.floor(i / 4), col = i % 4;
+    return { action: a, key: String(i + 1), x: x0 + col * (BTN.w + BTN.gap), y: BTN_TOP + row * (BTN.h + 12), w: BTN.w, h: BTN.h, flash: flash[a] || 0 };
+  });
+  OVL = { x: 12, y: 138, w: W - 24, h: BTN_TOP - 20 - 138 };
+  RESET_BTN = { x: OVL.x + OVL.w - 98, y: OVL.y + 12, w: 84, h: 30 };
+  DIAG = { cx: W / 2, cy: OVL.y + 196, R: 142, nr: 29 };
+  STATES.forEach((s, i) => {
+    const ang = -Math.PI / 2 + i * 2 * Math.PI / STATES.length;
+    nodePos[s] = [DIAG.cx + DIAG.R * Math.cos(ang), DIAG.cy + DIAG.R * Math.sin(ang)];
+  });
+}
+fit();
+
+const pet = new Pet();
+const G = { showBrain: false };
+const mouse = { x: -1, y: -1 };
+const inRect = (x, y, r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+
+function reset(fresh = true) {
+  if (fresh) pet.reset();
+  Object.assign(G, {
+    lastEdge: null, history: [], steps: 0, paused: false, dispColor: [...MOOD_COLORS[pet.state]],
+    particles: [], rings: [], react: null, t: 0, blinkTimer: rand(2, 4), blinking: 0, spawnAcc: 0, hovered: null,
+    voiceTimer: rand(2, 4),
+  });
+  G.layout = computeLayout();
+}
+
+function record(tr) {
+  G.history.unshift(tr); G.history.length = Math.min(G.history.length, 4);
+  G.lastEdge = [tr.old, tr.nw];
+  if (tr.nw !== tr.old) { G.rings.push({ age: 0, col: MOOD_COLORS[tr.nw] }); G.spawnAcc = 0; }
+}
+
+function applyAction(action) {
+  Sfx.init();
+  const tr = pet.apply(action);
+  G.steps++; G.react = { action, age: 0 };
+  buttons.forEach(b => { if (b.action === action) b.flash = 1; });
+  if (tr.reason !== "(asleep)") { spawnBurst(action); Sfx.action(action); }
+  else { floatText("zzz... (ignored)", [180, 180, 230]); Sfx.voice("Asleep"); }
+  if (action === "Kick" && navigator.vibrate) try { navigator.vibrate(70); } catch (e) {}
+  if (tr.nw !== tr.old) { Sfx.voice(tr.nw, 0.55); G.voiceTimer = rand(...VOICE_GAP[tr.nw]); }
+  record(tr);
+  save();
+}
+
+function computeLayout() {
+  const t = G.t, s = pet.state;
+  let cx = PET_CX, cy = PET_CY, sx = 1, sy = 1;
+  switch (s) {
+    case "Happy": cy -= Math.abs(Math.sin(t * 3)) * 12; break;
+    case "Playful": cy -= Math.abs(Math.sin(t * 4.5)) * 20; cx += Math.sin(t * 2.2) * 22; break;
+    case "Bored": cx += Math.sin(t * 0.6) * 3; cy += 4; break;
+    case "Angry": cx += rand(-2, 2); cy += rand(-1.2, 1.2); break;
+    case "Hungry": cx += Math.sin(t * 1.6) * 6; break;
+    case "Sad": cy += 12 + Math.sin(t * 1.0) * 3; break;
+    case "Sleepy": sy = 1 + 0.035 * Math.sin(t * 1.3); sx = 1 - 0.015 * Math.sin(t * 1.3); cy += 4; break;
+    case "Asleep": sy = 1 + 0.045 * Math.sin(t * 1.0); sx = 1 - 0.02 * Math.sin(t * 1.0); cy += 10; break;
+    case "Sick": cx += Math.sin(t * 22) * 1.4; cy += 8; break;
+    case "Drunk": cx += Math.sin(t * 1.3) * 26; cy += Math.sin(t * 2.6) * 5; break;
+  }
+  if (G.react) {
+    const { action, age } = G.react, p = Math.max(0, 1 - age / 0.6);
+    if (action === "Kick") cx += Math.sin(age * 70) * 18 * p;
+    else if (["Hug", "Food", "Candy"].includes(action)) { const sq = Math.sin(age * 20) * 0.12 * p; sx += sq; sy -= sq; }
+    else if (["Beer", "Medicine"].includes(action)) cx += Math.sin(age * 10) * 12 * p;
+    else if (action === "Play") cy -= Math.sin(age * 8) * 30 * p;
+    else if (action === "Bed") cy += 10 * p;
+  }
+  const bw = 240 * sx, bh = 210 * sy;
+  const body = { x: cx - bw / 2, y: cy - bh / 2, w: bw, h: bh };
+  const sw = bw * 0.78, shh = bh * 0.58, scy = cy - bh * 0.06;
+  const scr = { x: cx - sw / 2, y: scy - shh / 2, w: sw, h: shh };
+  const ey = scy - shh * 0.1;
+  return { cx, cy, body, scr, eyes: [[cx - sw * 0.24, ey], [cx + sw * 0.24, ey]], mouth: [cx, scy + shh * 0.26], u: shh / 120 };
+}
+
+function floatText(str, color, size = 38) {
+  const L = G.layout;
+  G.particles.push(new Particle("text", L.cx, L.body.y - 55, 0, -50, 1.4, color, size, 0, str));
+}
+
+function spawnAmbient() {
+  const L = G.layout, s = pet.state, { cx, cy, body } = L, [mx, my] = L.mouth, P = p => G.particles.push(p);
+  const top = body.y, bottom = body.y + body.h;
+  switch (s) {
+    case "Happy": { const ang = rand(0, 2 * Math.PI), d = rand(140, 175); P(new Particle("spark", cx + Math.cos(ang) * d, cy + Math.sin(ang) * d * 0.8, rand(-10, 10), rand(-35, -12), rand(1.1, 1.7), [255, 240, 150], rand(5, 10))); break; }
+    case "Playful": P(new Particle("confetti", cx + rand(-160, 160), top - rand(20, 80), rand(-20, 20), rand(-30, 10), rand(1.4, 2), choice(CONFETTI), rand(4, 7), 70)); break;
+    case "Bored": P(new Particle("text", cx + rand(70, 120), top + rand(-10, 20), rand(5, 15), -15, 2.4, [170, 172, 185], 28, 0, choice(["...", "meh", "sigh"]))); break;
+    case "Angry": { const side = choice([-1, 1]); P(new Particle("steam", cx + side * rand(30, 75), top + rand(-5, 10), side * rand(20, 60), rand(-110, -60), 0.9, [255, 130, 100], rand(6, 10))); break; }
+    case "Hungry":
+      if (Math.random() < 0.4) P(new Particle("text", cx + rand(-90, 90), bottom - 10, 0, -26, 1.6, [255, 210, 150], 24, 0, "grrr..."));
+      else if (Math.random() < 0.5) P(new Particle("icon", cx + rand(-130, 130), top - rand(0, 40), 0, -22, 1.8, [255, 200, 120], 26, 0, "food"));
+      else P(new Particle("tear", mx + rand(-6, 6), my + 12, 0, 20, 1, [170, 220, 255], 7, 250));
+      break;
+    case "Sad": { const [ex, ey] = choice(L.eyes); P(new Particle("tear", ex + rand(-4, 4), ey + 14, rand(-15, 15), rand(10, 40), 1.2, [120, 180, 255], 8, 450)); break; }
+    case "Sleepy": P(new Particle("text", cx + 55, top - 5, rand(18, 30), rand(-34, -24), 2.2, [210, 200, 255], rand(20, 28), 0, "z")); break;
+    case "Asleep": P(new Particle("text", cx + 60, top - 10, rand(22, 38), rand(-42, -30), 2.8, [190, 195, 255], rand(30, 48), 0, choice(["z", "Z"]))); break;
+    case "Sick":
+      if (Math.random() < 0.6) P(new Particle("germ", cx + rand(-150, 150), cy + rand(-80, 80), rand(-15, 15), rand(-22, -5), rand(1.6, 2.4), [150, 200, 80], rand(4, 7)));
+      else P(new Particle("tear", cx + rand(-60, 60), top + 20, rand(-10, 10), 10, 1, [190, 230, 255], 6, 300));
+      break;
+    case "Drunk":
+      if (Math.random() < 0.25) P(new Particle("text", cx + rand(-80, 80), top - 20, rand(-10, 10), -40, 1.4, [255, 190, 230], 30, 0, "hic!"));
+      else P(new Particle("bubble", cx + rand(-100, 100), top + rand(-20, 40), rand(-15, 15), rand(-60, -25), rand(1.2, 1.8), [255, 190, 230], rand(3, 7)));
+      break;
+  }
+}
+
+function spawnBurst(action) {
+  const L = G.layout, { cx, cy, body } = L, [mx, my] = L.mouth, P = p => G.particles.push(p);
+  const top = body.y, bottom = body.y + body.h;
+  if (action === "Kick") for (let i = 0; i < 14; i++) { const ang = rand(0, 2 * Math.PI), sp = rand(150, 320); P(new Particle("spark", body.x + 5, cy, Math.cos(ang) * sp, Math.sin(ang) * sp, 0.5, [255, 230, 120], rand(6, 11))); }
+  else if (action === "Hug") for (let i = 0; i < 10; i++) P(new Particle("heart", cx + rand(-110, 110), cy + rand(-40, 60), rand(-30, 30), rand(-100, -50), 1.6, [255, 120, 170], rand(8, 14)));
+  else if (action === "Play") for (let i = 0; i < 28; i++) { const ang = rand(-Math.PI, 0), sp = rand(120, 300); P(new Particle("confetti", cx, top, Math.cos(ang) * sp, Math.sin(ang) * sp, rand(1, 1.6), choice(CONFETTI), rand(4, 7), 300)); }
+  else if (action === "Food" || action === "Candy") {
+    for (let i = 0; i < 7; i++) {
+      const x = mx + rand(-140, 140), y = top - rand(60, 110);
+      P(new Particle("icon", x, y, (mx - x) / 0.6, (my - y) / 0.6, 0.6, action === "Food" ? [255, 190, 110] : [250, 150, 210], 28, 0, action === "Food" ? "food" : "Candy"));
+    }
+  }
+  else if (action === "Beer") for (let i = 0; i < 18; i++) P(new Particle("bubble", cx + rand(-100, 100), bottom - rand(0, 60), rand(-15, 15), rand(-130, -50), rand(1, 1.8), [255, 230, 140], rand(4, 9)));
+  else if (action === "Medicine") for (let i = 0; i < 10; i++) P(new Particle("icon", cx + rand(-110, 110), cy + rand(-30, 70), rand(-15, 15), rand(-80, -45), 1.4, choice([[120, 230, 140], [255, 255, 255]]), rand(12, 20), 0, "health"));
+  else if (action === "Bed") for (let i = 0; i < 6; i++) P(new Particle("text", cx + rand(-60, 60), top + rand(-20, 20), rand(-30, 30), rand(-70, -35), 1.8, [210, 200, 255], rand(28, 46), 0, "Z"));
+  const label = { Kick: "Ouch!", Hug: "Aww!", Play: "Wheee!", Food: "Yum!", Candy: "Sugar!", Beer: "Cheers!", Medicine: "Bleh...", Bed: "Bedtime..." }[action];
+  floatText(label, BUTTON_COLORS[action]);
+}
+
+function update(dt) {
+  G.t += dt;
+  if (!G.paused) {
+    const tr = pet.tick(dt);
+    if (tr) {
+      record(tr); floatText(`${tr.nw}!`, MOOD_COLORS[tr.nw], 34);
+      Sfx.voice(tr.nw); G.voiceTimer = rand(...VOICE_GAP[tr.nw]);
+    }
+    G.voiceTimer -= dt;
+    if (G.voiceTimer <= 0) { Sfx.voice(pet.state); G.voiceTimer = rand(...VOICE_GAP[pet.state]); }
+  }
+  const k = Math.min(1, dt * 4), target = MOOD_COLORS[pet.state];
+  G.dispColor = G.dispColor.map((c, i) => lerp(c, target[i], k));
+  G.blinkTimer -= dt;
+  if (G.blinkTimer <= 0) { G.blinking = 0.13; G.blinkTimer = rand(2.5, 6); }
+  G.blinking = Math.max(0, G.blinking - dt);
+  if (G.react) { G.react.age += dt; if (G.react.age > 0.8) G.react = null; }
+  G.layout = computeLayout();
+  if (!G.paused) {
+    G.spawnAcc += AMBIENT_RATE[pet.state] * dt;
+    while (G.spawnAcc >= 1) { spawnAmbient(); G.spawnAcc -= 1; }
+  }
+  G.particles = G.particles.filter(p => p.update(dt));
+  G.rings.forEach(r => r.age += dt); G.rings = G.rings.filter(r => r.age < 0.8);
+  buttons.forEach(b => b.flash = Math.max(0, b.flash - dt * 4));
+  const hb = buttons.find(b => inRect(mouse.x, mouse.y, b));
+  G.hovered = hb ? hb.action : null;
+}
+
+// ===========================================================================
+// 6. DRAWING
+// ===========================================================================
+function drawBackground() {
+  const mood = G.dispColor;
+  const top = lerpCol(BG_TOP, mood, 0.30), bottom = lerpCol(BG_BOTTOM, mood, 0.10);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, rgb(top)); g.addColorStop(0.65, rgb(bottom)); g.addColorStop(1, rgb(BG_BOTTOM));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = rgb(lerpCol(bottom, mood, 0.06)); ctx.fillRect(0, FLOOR_Y, W, BTN_TOP - 16 - FLOOR_Y);
+  line(0, FLOOR_Y, W, FLOOR_Y, rgb(lerpCol(bottom, mood, 0.25)), 2);
+  fillRR(0, BTN_TOP - 16, W, H - BTN_TOP + 40, 24, "rgb(16,17,27)");
+}
+
+function halfLidEye(ex, ey, r, cover, face, lw, look = [0, 0]) {
+  circle(ex, ey, r, rgb(face));
+  circle(ex + look[0], ey + look[1], Math.max(2, r / 2), rgb(SCREEN_BG));
+  const h = 2 * r * cover;
+  ctx.fillStyle = rgb(SCREEN_BG); ctx.fillRect(ex - r - 2, ey - r - 2, 2 * r + 4, h + 2);
+  line(ex - r - 3, ey - r + h, ex + r + 3, ey - r + h, rgb(face), Math.max(2, lw - 2));
+}
+function spiralEye(ex, ey, r, rot, face, lw) {
+  const pts = [];
+  for (let i = 0; i < 40; i++) { const th = i / 39 * 4 * Math.PI, rr = r * i / 39; pts.push([ex + Math.cos(th + rot) * rr, ey + Math.sin(th + rot) * rr]); }
+  polyline(pts, rgb(face), lw);
+}
+
+function drawPet() {
+  const L = G.layout, s = pet.state, { body, scr, u, cx } = L;
+  const mood = G.dispColor.map(Math.round), dark = shade(mood, 0.55), face = FACE_COLORS[s], F = rgb(face);
+  const lw = Math.max(3, 6 * u), t = G.t, PI = Math.PI;
+  const bTop = body.y, bBot = body.y + body.h;
+
+  ellipse(cx - body.w * 0.45, FLOOR_Y + 8 - 17, body.w * 0.9, 34, rgb(shade(lerpCol(BG_BOTTOM, mood, 0.1), 0.6)));
+  for (const side of [-1, 1]) ellipse(cx + side * 62 - 32, bBot + 6 - 14, 64, 28, rgb(dark));
+
+  for (const side of [-1, 1]) {
+    let wave = 0;
+    if (s === "Happy" && side === 1) wave = Math.sin(t * 6) * 10;
+    else if (s === "Playful") wave = Math.sin(t * 8 + side) * 16 + 10;
+    else if (s === "Drunk") wave = Math.sin(t * 1.6 + side) * 12;
+    const droop = ["Sad", "Sleepy", "Asleep", "Sick", "Bored"].includes(s) ? 18 : 0;
+    const ax = side < 0 ? body.x - 6 : body.x + body.w + 6, ay = L.cy + 10 + droop - wave;
+    fillRR(ax - 14, ay - 37, 28, 74, 14, rgb(dark));
+  }
+
+  const tip = [cx + Math.sin(t * 2.4) * 6, bTop - 44];
+  line(cx, bTop, tip[0], tip[1], rgb(dark), 5);
+  let bulb;
+  if (s === "Angry") bulb = Math.floor(t * 5) % 2 ? [255, 60, 50] : [120, 30, 30];
+  else if (s === "Sick") bulb = Math.floor(t * 1.5) % 2 ? [150, 220, 80] : [70, 100, 40];
+  else if (["Sleepy", "Asleep", "Bored"].includes(s)) bulb = [90, 85, 120];
+  else if (s === "Drunk") bulb = lerpCol([255, 120, 200], [120, 200, 255], 0.5 + 0.5 * Math.sin(t * 4));
+  else bulb = lerpCol(face, [255, 255, 255], 0.5 + 0.5 * Math.sin(t * 3));
+  circle(tip[0], tip[1], 11, rgb(bulb)); circle(tip[0], tip[1], 11, rgb(dark), 3);
+
+  fillRR(body.x, body.y, body.w, body.h, 60 * u, rgb(mood));
+  strokeRR(body.x + 2, body.y + 2, body.w - 4, body.h - 4, 58 * u, rgb(dark), 5);
+  fillRR(scr.x, scr.y, scr.w, scr.h, 30 * u, rgb(SCREEN_BG));
+  for (let y = scr.y + 10; y < scr.y + scr.h - 8; y += 6) line(scr.x + 14, y, scr.x + scr.w - 14, y, "rgb(33,39,57)", 1);
+  strokeRR(scr.x, scr.y, scr.w, scr.h, 30 * u, rgb(shade(mood, 0.75)), 4);
+
+  if (["Happy", "Playful", "Drunk"].includes(s)) {
+    const strength = s === "Drunk" ? 0.75 : 0.55;
+    for (const side of [-1, 1]) circle(cx + side * body.w * 0.33, scr.y + scr.h + 14, 13, rgb(lerpCol(mood, [255, 110, 140], strength)));
+  }
+
+  const blink = G.blinking > 0;
+  L.eyes.forEach(([ex, ey], i) => {
+    const inner = i === 0 ? 1 : -1;
+    if (s === "Happy" || (s === "Playful" && i === 0)) arcR(ex - 20, ey - 12, 40, 30, 0, PI, F, lw);
+    else if (s === "Playful") { circle(ex, ey, 14, F); circle(ex - 3, ey - 2, 6, rgb(SCREEN_BG)); }
+    else if (s === "Asleep") arcR(ex - 18, ey - 10, 36, 16, PI, 2 * PI, F, Math.max(2, lw - 3));
+    else if (s === "Bored") { if (blink) line(ex - 12, ey, ex + 12, ey, F, lw); else halfLidEye(ex, ey, 13, 0.5, face, lw, [6, 3]); }
+    else if (s === "Sleepy") { if (blink) line(ex - 12, ey, ex + 12, ey, F, lw); else halfLidEye(ex, ey, 13, 0.68 + 0.08 * Math.sin(t * 1.3), face, lw); }
+    else if (s === "Drunk") spiralEye(ex, ey, 16, t * 3 * inner, face, Math.max(2, lw - 3));
+    else {
+      const r = { Angry: 12, Hungry: 16, Sad: 10, Sick: 9 }[s];
+      if (blink) line(ex - r, ey, ex + r, ey, F, lw);
+      else {
+        circle(ex, ey, r, F);
+        if (s === "Hungry") { circle(ex + 4, ey - 5, 6, rgb(SCREEN_BG)); circle(ex + 6, ey - 7, 2, "#fff"); }
+      }
+      if (s === "Angry") line(ex - inner * 22, ey - 28, ex + inner * 16, ey - 15, F, lw);
+      else if (s === "Sad" || s === "Sick") line(ex - inner * 18, ey - 16, ex + inner * 16, ey - 27, F, Math.max(2, lw - 2));
+      if (s === "Sick") arcR(ex - 12, ey + 4, 24, 14, PI, 2 * PI, rgb(shade(face, 0.6)), 2);
+    }
+  });
+
+  const [mx, my] = L.mouth;
+  switch (s) {
+    case "Happy": arcR(mx - 36, my - 32, 72, 50, PI, 2 * PI, F, lw); break;
+    case "Playful":
+      ctx.beginPath(); ctx.ellipse(mx, my, 30, 21, 0, 0, PI); ctx.closePath(); ctx.fillStyle = F; ctx.fill();
+      ellipse(mx - 11, my + 8, 22, 12, "rgb(240,110,120)"); break;
+    case "Bored": line(mx - 18, my + 4, mx + 22, my + 2, F, Math.max(2, lw - 2)); break;
+    case "Angry": polyline([...Array(7)].map((_, i) => [mx - 30 + i * 10, my + (i % 2 ? 6 : -4)]), F, Math.max(2, lw - 2)); break;
+    case "Hungry": {
+      const h = 26 + Math.sin(t * 5) * 6;
+      ellipse(mx - 17, my - h / 2, 34, h, F);
+      ellipse(mx - 9, my + h / 2 - 3 - h * 0.4, 18, h * 0.4, "rgb(240,110,120)"); break;
+    }
+    case "Sad": arcR(mx - 28, my, 56, 36, 0, PI, F, Math.max(2, lw - 1)); break;
+    case "Sleepy": {
+      const yawn = Math.max(0, Math.sin(t * 0.7));
+      if (yawn > 0.8) ellipse(mx - 12, my - 14, 24, 18 + 22 * (yawn - 0.8) / 0.2, F);
+      else circle(mx, my + 4, 6, F, 3);
+      break;
+    }
+    case "Asleep": circle(mx, my + 4, 5 + 3 * Math.sin(t * 1.0), F, 3); break;
+    case "Sick":
+      polyline([...Array(14)].map((_, i) => [mx - 26 + i * 4, my + 6 + Math.sin(i * 1.2 + t * 2.5) * 3]), F, Math.max(2, lw - 3));
+      line(mx + 20, my + 6, mx + 78, my - 20, "rgb(235,235,240)", 6); circle(mx + 20, my + 6, 6, "rgb(230,60,60)"); break;
+    case "Drunk": { const off = Math.sin(t * 2) * 6; arcR(mx - 38 + off, my - 30, 76, 50, PI * 1.05, PI * 1.95, F, lw); break; }
+  }
+}
+
+function drawEffects() {
+  for (const r of G.rings) {
+    const k = r.age / 0.8;
+    ctx.globalAlpha = 0.8 * (1 - k);
+    circle(G.layout.cx, G.layout.cy, 120 + k * 240, rgb(r.col), Math.max(1, 8 * (1 - k)));
+  }
+  ctx.globalAlpha = 1;
+  G.particles.forEach(p => p.draw());
+}
+
+function statColor(v) { return v > 50 ? [110, 210, 120] : v > 25 ? [240, 190, 70] : [235, 85, 75]; }
+
+function drawHeader() {
+  const cur = pet.state;
+  text(cur, 22, 18, 36, rgb(MOOD_COLORS[cur]), "left", "top", 800);
+  const ti = pet.timerInfo();
+  let info = `for ${Math.floor(pet.timeInState)}s`;
+  if (G.paused) info += "  ·  paused";
+  else if (ti) info += `  ·  ${ti[0]} in ${Math.ceil(ti[1])}s`;
+  text(info, 22, 62, 13, rgb(MUTED), "left", "top", 500);
+
+  for (const hb of HEADER_BTNS) {
+    const active = hb.id === "brain" && G.showBrain;
+    circle(hb.x, hb.y, 22, active ? rgb(MOOD_COLORS[cur]) : "rgb(34,37,54)");
+    const ink = active ? INK : rgb(TEXT);
+    const icon = hb.id === "sound" ? (Sfx.on ? "sound" : "mute") : hb.id === "pause" ? (G.paused ? "play" : "pause") : "brain";
+    drawIcon(icon, hb.x, hb.y, 24, ink);
+  }
+
+  const colW = (W - 44 - 3 * 12) / 4;
+  STAT_ORDER.forEach(([key, name], i) => {
+    const v = pet.stats[key], x = 22 + i * (colW + 12), col = statColor(v);
+    const warn = v < 25 && Math.floor(G.t * 2.5) % 2 === 0;
+    drawIcon(key, x + 9, 102, 18, rgb(warn ? [255, 255, 255] : col));
+    text(name, x + 24, 102, 13, rgb(TEXT), "left", "middle", 600);
+    text(String(Math.floor(v)), x + colW, 102, 13, rgb(col), "right", "middle", 700);
+    fillRR(x, 116, colW, 8, 4, "rgb(40,42,58)");
+    if (v > 0) fillRR(x, 116, Math.max(6, colW * v / 100), 8, 4, rgb(col));
+  });
+}
+
+function drawStatusLine() {
+  const y = Math.min(BTN_TOP - 48, FLOOR_Y + 72), cur = pet.state;
+  if (G.hovered && !IS_TOUCH) {
+    const [pv, guard] = pet.preview(G.hovered);
+    let s = `${G.hovered}  →  ${pv}`;
+    if (guard) s += `   [${guard}]`; else if (pv === cur) s += "   (stays)";
+    text(s, W / 2, y, 15, rgb(MOOD_COLORS[pv]), "center", "middle", 700);
+  } else if (G.history.length) {
+    const tr = G.history[0];
+    const s = `${tr.trigger}:  ${tr.old} → ${tr.nw}  ${tr.reason}`;
+    text(s, W / 2, y, 14, rgb(MUTED), "center", "middle", 600);
+  } else text(IS_TOUCH ? "Tap an action below" : "Click an action or press 1-8", W / 2, y, 14, rgb(MUTED), "center", "middle", 500);
+  if (G.paused) text("PAUSED", W / 2, PET_CY + 50, 40, "#fff", "center", "middle", 800);
+}
+
+function drawButtons() {
+  for (const b of buttons) {
+    const hov = G.hovered === b.action, y = b.y - (hov ? 3 : 0);
+    const base = lerpCol(BUTTON_COLORS[b.action], [255, 255, 255], b.flash);
+    fillRR(b.x, b.y + 4, b.w, b.h, 18, "rgb(5,5,10)");
+    fillRR(b.x, y, b.w, b.h, 18, rgb(shade(base, hov ? 1.1 : 1)));
+    strokeRR(b.x + 1.5, y + 1.5, b.w - 3, b.h - 3, 17, rgb(shade(base, 0.62)), 3);
+    drawIcon(b.action, b.x + b.w / 2, y + 48, 52, INK);
+    text(b.action, b.x + b.w / 2, y + 94, 17, INK, "center", "middle", 700);
+    let sub = IS_TOUCH ? "" : `key ${b.key}`, subCol = rgb(shade(base, 0.45));
+    if (hov && !IS_TOUCH) { const pv = pet.preview(b.action)[0]; sub = `→ ${pv}`; subCol = rgb(shade(MOOD_COLORS[pv], 0.5)); }
+    if (sub) text(sub, b.x + b.w / 2, y + 112, 12, subCol, "center", "middle", 700);
+  }
+}
+
+function drawBrain() {
+  fillRR(OVL.x, OVL.y, OVL.w, OVL.h, 20, "rgba(14,16,26,0.95)");
+  strokeRR(OVL.x, OVL.y, OVL.w, OVL.h, 20, "rgb(40,44,62)", 2);
+  const cur = pet.state, x0 = OVL.x + 18;
+  text("STATE MACHINE", x0, OVL.y + 18, 13, rgb(MUTED), "left", "top", 700);
+  text(`steps: ${G.steps}`, x0, OVL.y + 36, 12, rgb(MUTED), "left", "top", 500);
+  fillRR(RESET_BTN.x, RESET_BTN.y, RESET_BTN.w, RESET_BTN.h, 15, "rgb(60,40,48)");
+  text("Reset", RESET_BTN.x + RESET_BTN.w / 2, RESET_BTN.y + RESET_BTN.h / 2, 13, "rgb(255,170,170)", "center", "middle", 700);
+
+  const nr = DIAG.nr, targets = new Set();
+  ACTIONS.forEach(a => possibleTargets(cur, a).forEach(x => targets.add(x)));
+  targets.forEach(tg => { if (tg !== cur) drawArrow("rgb(58,63,86)", nodePos[cur], nodePos[tg], nr, 2); });
+  if (G.lastEdge && G.lastEdge[0] !== G.lastEdge[1]) drawArrow(rgb(MOOD_COLORS[G.lastEdge[1]]), nodePos[G.lastEdge[0]], nodePos[G.lastEdge[1]], nr, 4);
+  const [preview, guard] = G.hovered ? pet.preview(G.hovered) : [null, null];
+  if (preview && preview !== cur) drawArrow("#fff", nodePos[cur], nodePos[preview], nr, 3, true);
+
+  for (const st of STATES) {
+    const [px, py] = nodePos[st], reachable = targets.has(st) || st === cur, mc = MOOD_COLORS[st];
+    let col;
+    if (st === cur) {
+      circle(px, py, nr + 4 + 3 * Math.sin(G.t * 3), rgb(shade(mc, 0.5)), 3);
+      circle(px, py, nr, rgb(mc));
+      col = (0.299 * mc[0] + 0.587 * mc[1] + 0.114 * mc[2]) > 140 ? "rgb(25,25,35)" : "rgb(245,245,250)";
+    } else {
+      circle(px, py, nr, "rgb(34,37,54)");
+      circle(px, py, nr - 1.5, rgb(reachable ? mc : shade(mc, 0.45)), 3);
+      col = rgb(reachable ? TEXT : MUTED);
+    }
+    text(st, px, py, 11.5, col, "center", "middle", 700);
+  }
+  const hint = G.hovered ? `${G.hovered}: ${cur} → ${preview}${guard ? `  [${guard}]` : preview === cur ? "  (stays)" : ""}`
+                         : "Grey arrows = where actions can take it now";
+  text(hint, W / 2, OVL.y + 372, 13, G.hovered ? rgb(MOOD_COLORS[preview]) : rgb(MUTED), "center", "middle", 600);
+
+  const hy = OVL.y + 392;
+  text("HISTORY", x0, hy, 12, rgb(MUTED), "left", "top", 700);
+  line(x0, hy + 18, OVL.x + OVL.w - 18, hy + 18, "rgb(40,44,62)", 1);
+  if (!G.history.length) text("No transitions yet", x0, hy + 28, 13, "rgb(80,84,105)", "left", "top", 500);
+  G.history.forEach((tr, i) => {
+    const y = hy + 26 + i * 21;
+    ctx.globalAlpha = 1 - i * 0.18;
+    text(tr.trigger, x0, y, 15, rgb(BUTTON_COLORS[tr.trigger] || MUTED), "left", "top", 700);
+    let x = x0 + 86;
+    for (const [str, col, size] of [[tr.old, MOOD_COLORS[tr.old], 15], ["→", MUTED, 15], [tr.nw, MOOD_COLORS[tr.nw], 15], [tr.reason, MUTED, 12]]) {
+      if (!str) continue;
+      text(str, x, y + (size < 15 ? 2 : 0), size, rgb(col), "left", "top", 700);
+      x += textW(str, size, 700) + 8;
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  drawBackground(); drawPet(); drawEffects();
+  if (G.showBrain) drawBrain();
+  drawHeader(); drawStatusLine(); drawButtons();
+}
+
+// ===========================================================================
+// 7. SAVE / RESUME (the pet keeps living a little while you're away)
+// ===========================================================================
+const SAVE_KEY = "cyberpet.v3";
+const MAX_AWAY = 300;  // seconds simulated while the app was closed
+function save() {
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify({ state: pet.state, stats: pet.stats, tis: pet.timeInState, steps: G.steps, sound: Sfx.on, at: Date.now() })); } catch (e) {}
+}
+function catchUp(seconds) {
+  seconds = Math.min(MAX_AWAY, Math.max(0, seconds));
+  let last = null;
+  for (let s = 0; s < seconds; s += 0.25) { const tr = pet.tick(0.25); if (tr) last = tr; }
+  if (last) record(last);
+}
+function load() {
+  try {
+    const d = JSON.parse(localStorage.getItem(SAVE_KEY) || "null");
+    if (!d || !STATES.includes(d.state)) return false;
+    pet.state = d.state; pet.timeInState = d.tis || 0;
+    for (const k of Object.keys(START_STATS)) if (typeof d.stats[k] === "number") pet.stats[k] = clamp(d.stats[k]);
+    Sfx.on = d.sound !== false;
+    reset(false);
+    G.steps = d.steps || 0;
+    catchUp((Date.now() - d.at) / 1000);
+    return true;
+  } catch (e) { return false; }
+}
+let hiddenAt = 0;
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { hiddenAt = Date.now(); save(); if (Sfx.ctx) Sfx.ctx.suspend(); }
+  else { if (hiddenAt && !G.paused) catchUp((Date.now() - hiddenAt) / 1000); hiddenAt = 0; G.dispColor = [...MOOD_COLORS[pet.state]]; }
+});
+window.addEventListener("pagehide", save);
+setInterval(save, 5000);
+
+// ===========================================================================
+// 8. INPUT
+// ===========================================================================
+function toGame(e) {
+  const r = canvas.getBoundingClientRect();
+  return [(e.clientX - r.left) * W / r.width, (e.clientY - r.top) * H / r.height];
+}
+function togglePause() { G.paused = !G.paused; Sfx.click(); }
+canvas.addEventListener("pointermove", e => { if (e.pointerType === "mouse") [mouse.x, mouse.y] = toGame(e); });
+canvas.addEventListener("pointerleave", () => { mouse.x = mouse.y = -1; });
+canvas.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  canvas.focus();
+  Sfx.init();
+  const [x, y] = toGame(e);
+  for (const hb of HEADER_BTNS) {
+    if (Math.hypot(x - hb.x, y - hb.y) <= 26) {
+      if (hb.id === "brain") G.showBrain = !G.showBrain;
+      else if (hb.id === "sound") { Sfx.on = !Sfx.on; save(); }
+      else togglePause();
+      Sfx.click();
+      return;
+    }
+  }
+  if (G.showBrain && inRect(x, y, RESET_BTN)) { reset(); save(); Sfx.click(); return; }
+  const b = buttons.find(b => inRect(x, y, b));
+  if (b) applyAction(b.action);
+});
+canvas.addEventListener("keydown", e => {
+  Sfx.init();
+  if (e.key >= "1" && e.key <= String(ACTIONS.length)) { applyAction(ACTIONS[+e.key - 1]); e.preventDefault(); }
+  else if (e.key === " ") { togglePause(); e.preventDefault(); }
+  else if (e.key === "r" || e.key === "R") { reset(); save(); }
+  else if (e.key === "b" || e.key === "B") G.showBrain = !G.showBrain;
+  else if (e.key === "m" || e.key === "M") { Sfx.on = !Sfx.on; save(); }
+});
+
+// ===========================================================================
+// 9. START
+// ===========================================================================
+if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+}
+try {
+  validateFsm();
+  if (!load()) reset();
+  canvas.focus();
+  let last = performance.now();
+  (function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    update(dt); draw();
+    requestAnimationFrame(frame);
+  })(last);
+} catch (err) {
+  ctx.fillStyle = "#200"; ctx.fillRect(0, 0, W, H);
+  err.message.split("\n").forEach((ln, i) => text(ln, 20, 20 + i * 20, 15, "#f88"));
+  console.error(err);
+}
+</script>
+</body>
+</html>
